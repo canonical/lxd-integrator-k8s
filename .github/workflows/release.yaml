@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      track:
+        description: Track to publish to
+        required: true
+        default: latest
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run lint
+        run: |
+          tox -e lint
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run unit tests
+        run: |
+          tox -e unit
+
+  static:
+    name: Static type checks
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run static checks
+        run: |
+          tox -e static
+
+  build-charm:
+    name: Build charm
+    runs-on: ubuntu-24.04
+    needs: [lint, unit, static]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Pack charm
+        uses: canonical/craft-actions/charmcraft/pack@39a1fa1fd30fb8bef5abb80a24f3a06ad6261d17
+
+      - name: Upload charm artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: charm
+          path: "*.charm"
+          if-no-files-found: error
+
+  release:
+    name: Release charm
+    runs-on: ubuntu-24.04
+    needs: [build-charm]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download charm artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.9
+        with:
+          name: charm
+          path: artifacts/charm
+
+      - name: Resolve artifact paths
+        id: artifacts
+        run: |
+          charm="$(realpath artifacts/charm/*.charm | head -n1)"
+          echo "charm=$charm" >> "$GITHUB_OUTPUT"
+
+      - name: Upload charm to Charmhub
+        uses: canonical/charming-actions/upload-charm@1753e0803f70445132e92acd45c905aba6473225 # 2.7.0
+        with:
+          credentials: "${{ secrets.CHARMHUB_TOKEN }}"
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          charm-path: .
+          built-charm-path: "${{ steps.artifacts.outputs.charm }}"
+          channel: "${{ inputs.track || 'latest' }}/edge"
+          tag-prefix: "${{ inputs.track || 'latest' }}"

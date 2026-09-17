@@ -1,0 +1,6 @@
+/venv
+*.py[cod]
+*.charm
+*/.mypy_cache
+*/.pytest_cache
+*/.ruff_cache
