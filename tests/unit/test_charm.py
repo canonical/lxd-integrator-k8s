@@ -634,3 +634,77 @@ def test_reconcile_skips_on_verification_error(cert_pair, transport):
     assert rel_out.local_unit_data["addresses"] == "localhost:8443"
     assert len([r for r in tr.requests if r[:2] == ("GET", "/1.0/certificates?recursion=1")]) == 0
     assert len([r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]) == 0
+
+
+def test_project_published_to_requirer(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    state_out = _run_reconcile(ctx, state, tr)
+
+    rel_out = state_out.get_relation(relation.id)
+    assert rel_out.local_unit_data["project"] == "openshell"
+
+
+def test_project_absent_from_databag_when_unset(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
+    state = base_state(relations={relation}, leader=True)
+    tr = transport()
+    state_out = _run_reconcile(ctx, state, tr)
+
+    rel_out = state_out.get_relation(relation.id)
+    assert "project" not in rel_out.local_unit_data
+
+
+def test_unsetting_project_clears_it_from_the_databag(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        local_unit_data={"project": "openshell"},
+    )
+    state = base_state(relations={relation}, leader=True)
+    tr = transport()
+    state_out = _run_reconcile(ctx, state, tr)
+
+    rel_out = state_out.get_relation(relation.id)
+    assert "project" not in rel_out.local_unit_data
+
+
+def test_project_restricts_the_trust_entry(base_state, transport, requirer_cert):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    state = base_state(
+        relations={relation},
+        leader=True,
+        project="openshell",
+        **{"default-projects": "project-a, project-b"},
+    )
+    tr = transport()
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
+    tr.add_response("POST", "/1.0/certificates", 200, {})
+    _run_reconcile(ctx, state, tr)
+
+    post = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")][0]
+    body = json.loads(post[2] or b"{}")
+    assert body["projects"] == ["openshell"]
+    assert body["restricted"] is True
+
+
+def test_invalid_project_is_a_config_error(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    state = base_state(leader=True, project="bad/project")
+    with ctx._run(ctx.on.config_changed(), state) as ops:
+        ops.charm._connection_factory = transport()
+        ops.run()
+        charm = ops.charm
+
+    assert charm._model is None
+    assert charm._config_error is not None
+    assert "project" in charm._config_error

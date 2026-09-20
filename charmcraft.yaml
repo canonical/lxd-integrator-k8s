@@ -70,13 +70,23 @@ config:
         SHA-256 fingerprint (hex) of the LXD server's TLS certificate. Exactly
         one of lxd-server-fingerprint or the server-cert key in the
         lxd-credentials secret must be provided.
+    project:
+      type: string
+      description: |
+        LXD project requirers operate in. The integrator publishes it over the
+        lxd-https interface and requirers place every instance, image, network
+        and operation they create in it. The project must already exist on the
+        LXD server; the integrator does not create it. When set, a requirer's
+        certificate is also restricted to this project in the LXD trust store,
+        so the isolation is enforced by LXD and not only by requirer
+        behaviour. Leave unset to have requirers use the LXD "default" project.
     default-projects:
       type: string
       description: |
         Comma-separated list of default LXD projects used as the fallback project
-        restriction when adding a requirer's certificate to LXD. When set, every
-        requirer that does not publish its own projects list is restricted to these
-        projects. Leave unset to allow the requirer access to all projects.
+        restriction when adding a requirer's certificate to LXD. It applies only
+        when neither the requirer publishes its own projects list nor the project
+        option is set. Leave unset to allow the requirer access to all projects.
     trust-name-prefix:
       type: string
       default: juju-relation

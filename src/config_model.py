@@ -19,6 +19,10 @@ from verification_mode import VerificationMode
 
 DEFAULT_LXD_PORT: int = 8443
 
+# LXD project names travel in a URL path segment and end up on a requirer's
+# command line, so the accepted charset is deliberately narrow.
+PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,63}")
+
 
 @dataclass(frozen=True)
 class LxdConnectionParams:
@@ -47,6 +51,7 @@ class IntegratorConfig(pydantic.BaseModel):
 
     lxd_endpoints: str = Field(alias="lxd-endpoints")
     lxd_server_fingerprint: str | None = Field(default=None, alias="lxd-server-fingerprint")
+    project: str | None = Field(default=None, alias="project")
     default_projects: str | None = Field(default=None, alias="default-projects")
     trust_name_prefix: str = Field(default="juju-relation", alias="trust-name-prefix")
 
@@ -58,6 +63,7 @@ class IntegratorConfig(pydantic.BaseModel):
 
     @field_validator(
         "lxd_server_fingerprint",
+        "project",
         "default_projects",
         "client_cert",
         "client_key",
@@ -70,6 +76,25 @@ class IntegratorConfig(pydantic.BaseModel):
         """Normalise Juju's empty-string representation of 'unset' to None."""
         if v == "":
             return None
+        return v
+
+    @field_validator("project", mode="after")
+    @classmethod
+    def _project_name_valid(cls, v: str | None) -> str | None:
+        """Reject values LXD would not accept as a project name.
+
+        LXD project names are URL path segments: letters, digits, hyphens,
+        underscores and dots, up to 63 characters. Validating here keeps
+        unusable values out of the relation databag, where a requirer would
+        otherwise interpolate them into a command line.
+        """
+        if v is None:
+            return v
+        if not PROJECT_NAME_RE.fullmatch(v):
+            raise PydanticCustomError(
+                "invalid_project",
+                "project must be 1-63 characters of letters, digits, '.', '-' or '_'",
+            )
         return v
 
     @field_validator("trust_name_prefix", mode="after")
@@ -134,7 +159,13 @@ class IntegratorConfig(pydantic.BaseModel):
 
     @property
     def parsed_projects(self) -> list[str]:
-        """Default projects split into a stripped, non-empty list."""
+        """Project restriction for requirers that publish no list of their own.
+
+        ``project`` wins over ``default-projects``: a requirer told to operate
+        in one project has no business holding trust in any other.
+        """
+        if self.project is not None:
+            return [self.project]
         if self.default_projects is None:
             return []
         return [part.strip() for part in self.default_projects.split(",") if part.strip()]

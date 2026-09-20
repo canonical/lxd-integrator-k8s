@@ -134,6 +134,8 @@ class LxdIntegratorCharm(ops.CharmBase):
         }
         if self._model.server_cert is not None:
             bag["certificate"] = self._model.server_cert
+        if self._model.project is not None:
+            bag["project"] = self._model.project
         return bag
 
     def _server_fingerprint(self) -> str:
@@ -157,6 +159,12 @@ class LxdIntegratorCharm(ops.CharmBase):
                 continue
             target = relation.data[self.app] if clustered else relation.data[self.unit]
             target.update(bag)
+            # update() never removes, so an optional key that has just been
+            # unset in config would otherwise linger in the databag and keep
+            # requirers pointed at a project the operator no longer wants.
+            for optional in ("certificate", "project"):
+                if optional not in bag:
+                    target.pop(optional, None)
 
     def _trust_name(self, relation: ops.Relation) -> str:
         """Return the LXD trust entry name for a related application.
@@ -363,6 +371,7 @@ class LxdIntegratorCharm(ops.CharmBase):
                 "endpoint": addresses[0],
                 "certificate-fingerprint": self._server_fingerprint(),
                 "addresses": ",".join(addresses),
+                "project": self._model.project or "",
             }
         )
 
