@@ -27,8 +27,9 @@ actions:
       published to requirers. Fails cleanly when LXD is unreachable.
   list-trusted-clients:
     description: |
-      List trust-store entries owned by this charm (matching trust-name-prefix).
-      Fails cleanly when LXD is unreachable.
+      List trust-store entries owned by this charm (matching trust-name-prefix),
+      with the projects each one is restricted to. Fails cleanly when LXD is
+      unreachable.
 
 base: ubuntu@24.04
 platforms:

@@ -429,7 +429,15 @@ class LxdIntegratorCharm(ops.CharmBase):
             return
 
         owned = [
-            {"name": entry.get("name", ""), "fingerprint": entry.get("fingerprint", "")}
+            {
+                "name": entry.get("name", ""),
+                "fingerprint": entry.get("fingerprint", ""),
+                # The projects an entry is restricted to are the whole point of
+                # the `project` option, so an operator has to be able to see
+                # them without reaching for the LXD CLI.
+                "restricted": bool(entry.get("restricted")),
+                "projects": entry.get("projects") or [],
+            }
             for entry in entries
             if self._is_charm_owned(entry)
         ]

@@ -803,3 +803,52 @@ def test_another_charms_trust_entry_is_never_touched(base_state, transport, requ
     _run_reconcile(ctx, state, tr)
 
     assert not [r for r in tr.requests if r[0] == "PATCH"]
+
+
+def test_list_trusted_clients_reports_the_project_restriction(base_state, transport):
+    # The restriction is the whole point of the project option, so it has to be
+    # visible without reaching for the LXD CLI.
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    state = base_state(leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": _expected_trust_name("openshell-gateway"),
+                "fingerprint": "aa" * 32,
+                "restricted": True,
+                "projects": ["openshell"],
+            }
+        ],
+    )
+
+    with ctx._run(ctx.on.action("list-trusted-clients"), state) as ops:
+        ops.charm._connection_factory = tr
+        ops.run()
+
+    client = ctx.action_results["clients"][0]
+    assert client["projects"] == ["openshell"]
+    assert client["restricted"] is True
+
+
+def test_list_trusted_clients_reports_an_unrestricted_entry(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    state = base_state(leader=True)
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [{"name": _expected_trust_name("openshell-gateway"), "fingerprint": "aa" * 32}],
+    )
+
+    with ctx._run(ctx.on.action("list-trusted-clients"), state) as ops:
+        ops.charm._connection_factory = tr
+        ops.run()
+
+    client = ctx.action_results["clients"][0]
+    assert client["projects"] == []
+    assert client["restricted"] is False
