@@ -248,12 +248,18 @@ class LxdIntegratorCharm(ops.CharmBase):
                 continue
             name = self._trust_name(relation)
             expected_by_name[name] = fp
+            projects = self._requirer_projects(relation)
             if fp in known_fingerprints:
+                # The entry exists, but the project restriction is config and
+                # config changes. Without this the isolation an operator asks
+                # for by setting `project` never reaches LXD on an existing
+                # relation, and the entry silently keeps its old reach.
+                self._converge_trust_projects(client, trust_entries, fp, projects)
                 continue
             client.add_trusted_certificate(
                 cert,
                 name=name,
-                projects=self._requirer_projects(relation),
+                projects=projects,
                 trust_token=self._model.trust_token,
             )
 
@@ -267,6 +273,34 @@ class LxdIntegratorCharm(ops.CharmBase):
             expected_fp = expected_by_name.get(name)
             if expected_fp is None or expected_fp != entry_fp:
                 client.remove_trusted_certificate(entry_fp)
+
+    def _converge_trust_projects(
+        self,
+        client: LxdClient,
+        trust_entries: list[dict],
+        fingerprint: str,
+        projects: list[str],
+    ) -> None:
+        """Bring an existing entry's project restriction in line with config."""
+        entry = next(
+            (e for e in trust_entries if e.get("fingerprint", "").lower() == fingerprint),
+            None,
+        )
+        if entry is None or not self._is_charm_owned(entry):
+            return
+
+        current = entry.get("projects") or []
+        restricted = bool(entry.get("restricted"))
+        if sorted(current) == sorted(projects) and restricted == bool(projects):
+            return
+
+        logger.info(
+            "Updating trust entry %s: projects %s -> %s",
+            entry.get("name", fingerprint),
+            current,
+            projects,
+        )
+        client.set_trusted_certificate_projects(fingerprint, projects)
 
     def _reconcile(self, event: ops.EventBase) -> None:
         """Idempotently publish connection info and converge the LXD trust store."""

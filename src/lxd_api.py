@@ -217,6 +217,17 @@ class LxdClient:
                 return
             raise
 
+    def set_trusted_certificate_projects(self, fingerprint: str, projects: list[str]) -> None:
+        """Update an existing trust entry's project restriction in place.
+
+        Used when the configured project changes after the entry was created.
+        Patching beats delete-and-recreate: the requirer holds a live
+        connection with this certificate, and revoking it even briefly would
+        break in-flight operations.
+        """
+        data: dict[str, Any] = {"projects": projects, "restricted": bool(projects)}
+        self._request("PATCH", f"/1.0/certificates/{fingerprint}", body=json.dumps(data))
+
     def remove_trusted_certificate(self, fingerprint: str) -> None:
         """Remove a trusted certificate via ``DELETE /1.0/certificates/<fp>``."""
         self._request("DELETE", f"/1.0/certificates/{fingerprint}")

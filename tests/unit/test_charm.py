@@ -708,3 +708,98 @@ def test_invalid_project_is_a_config_error(base_state, transport):
     assert charm._model is None
     assert charm._config_error is not None
     assert "project" in charm._config_error
+
+
+def test_changing_the_project_updates_an_existing_trust_entry(
+    base_state, transport, requirer_cert
+):
+    # The entry is created before the project is configured, which is the
+    # ordering an operator hits when they set `project` on a running
+    # deployment. Without convergence the isolation never reaches LXD.
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    fingerprint = pem_fingerprint(requirer_cert.strip())
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": _expected_trust_name("openshell-gateway"),
+                "fingerprint": fingerprint,
+                "projects": [],
+                "restricted": False,
+            }
+        ],
+    )
+    tr.add_response("PATCH", f"/1.0/certificates/{fingerprint}", 200, {})
+    _run_reconcile(ctx, state, tr)
+
+    patches = [r for r in tr.requests if r[0] == "PATCH"]
+    assert len(patches) == 1
+    body = json.loads(patches[0][2] or b"{}")
+    assert body["projects"] == ["openshell"]
+    assert body["restricted"] is True
+    assert not [r for r in tr.requests if r[0] == "DELETE"]
+
+
+def test_a_matching_trust_entry_is_left_alone(base_state, transport, requirer_cert):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    fingerprint = pem_fingerprint(requirer_cert.strip())
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": _expected_trust_name("openshell-gateway"),
+                "fingerprint": fingerprint,
+                "projects": ["openshell"],
+                "restricted": True,
+            }
+        ],
+    )
+    _run_reconcile(ctx, state, tr)
+
+    assert not [r for r in tr.requests if r[0] in ("PATCH", "POST", "DELETE")]
+
+
+def test_another_charms_trust_entry_is_never_touched(base_state, transport, requirer_cert):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    fingerprint = pem_fingerprint(requirer_cert.strip())
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": "someone-elses-entry",
+                "fingerprint": fingerprint,
+                "projects": [],
+                "restricted": False,
+            }
+        ],
+    )
+    _run_reconcile(ctx, state, tr)
+
+    assert not [r for r in tr.requests if r[0] == "PATCH"]
