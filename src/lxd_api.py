@@ -204,9 +204,13 @@ class LxdClient:
             "name": name,
         }
         if projects is not None:
+            # Always explicit, so this path and the PATCH in
+            # ``set_trusted_certificate_projects`` cannot disagree about what
+            # an empty list means. LXD defaults ``restricted`` to false, so
+            # leaving it out for an empty list registered an unrestricted
+            # certificate without ever saying so.
             data["projects"] = projects
-            if projects:
-                data["restricted"] = True
+            data["restricted"] = bool(projects)
         if trust_token is not None:
             data["trust_token"] = trust_token
 

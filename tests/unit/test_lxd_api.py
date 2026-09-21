@@ -347,7 +347,7 @@ def test_add_trusted_certificate_sets_restricted(cert_pair):
     assert base64.b64decode(payload["certificate"]) == cert_der
 
 
-def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
+def test_add_trusted_certificate_says_an_empty_list_is_unrestricted(cert_pair):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
     conn = FakeConnection(cert_der, json.dumps({"metadata": {}}).encode())
@@ -361,7 +361,10 @@ def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
     )
     client.add_trusted_certificate(cert_pem, "test", projects=[])
     payload = json.loads(conn.requests[0][2] or b"{}")
-    assert "restricted" not in payload
+    # Explicit, so this and the PATCH in set_trusted_certificate_projects
+    # cannot disagree: LXD's own default for a missing key is false, which
+    # registered an unrestricted certificate without saying so.
+    assert payload["restricted"] is False
     assert payload["projects"] == []
     assert base64.b64decode(payload["certificate"]) == cert_der
 
