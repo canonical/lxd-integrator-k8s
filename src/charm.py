@@ -220,7 +220,6 @@ class LxdIntegratorCharm(ops.CharmBase):
     def _converge_trust(
         self,
         client: LxdClient,
-        live_relations: set[str],
         broken_relation_id: int | None = None,
     ) -> None:
         """Register related certs and revoke orphaned or rotated charm-owned entries."""
@@ -312,17 +311,15 @@ class LxdIntegratorCharm(ops.CharmBase):
             return
 
         broken_relation_id: int | None = None
-        live_relations: set[str] = set()
         for relation in self.model.relations[HTTPS_RELATION]:
             if relation.app is None:
                 continue
             if isinstance(event, ops.RelationBrokenEvent) and event.relation.id == relation.id:
                 broken_relation_id = relation.id
-                continue
-            live_relations.add(relation.app.name)
+                break
 
         try:
-            self._converge_trust(client, live_relations, broken_relation_id)
+            self._converge_trust(client, broken_relation_id)
         except (LxdConnectionError, VerificationError, LxdApiError) as exc:
             logger.warning("Skipping trust convergence: %s", exc)
 
