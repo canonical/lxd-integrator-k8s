@@ -479,20 +479,25 @@ class LxdIntegratorCharm(ops.CharmBase):
             event.fail(f"LXD API error: {exc}")
             return
 
-        owned = [
-            {
+        # Keyed by position rather than collected into a list: ops flattens a
+        # nested mapping into the dotted keys Juju's action results use, but
+        # stringifies a list, which turned this output into a Python repr that
+        # is neither YAML nor JSON and cannot be read by a script.
+        owned = {
+            str(index): {
                 "name": entry.get("name", ""),
                 "fingerprint": entry.get("fingerprint", ""),
                 # The projects an entry is restricted to are the whole point of
                 # the `project` option, so an operator has to be able to see
                 # them without reaching for the LXD CLI.
-                "restricted": bool(entry.get("restricted")),
-                "projects": entry.get("projects") or [],
+                "restricted": "true" if entry.get("restricted") else "false",
+                "projects": ",".join(entry.get("projects") or []),
             }
-            for entry in entries
-            if self._is_charm_owned(entry)
-        ]
-        event.set_results({"clients": owned})
+            for index, entry in enumerate(
+                entry for entry in entries if self._is_charm_owned(entry)
+            )
+        }
+        event.set_results({"clients": owned, "count": str(len(owned))})
 
 
 if __name__ == "__main__":

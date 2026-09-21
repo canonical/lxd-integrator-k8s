@@ -500,8 +500,11 @@ def test_list_trusted_clients_action(base_state, transport):
         ops.run()
 
     clients = ctx.action_results["clients"]
-    assert len(clients) == 1
-    assert clients[0]["name"] == _expected_trust_name("openshell-gateway")
+    assert ctx.action_results["count"] == "1"
+    # Keyed by position so ops flattens it into Juju's dotted result keys; a
+    # list here came back out as a Python repr.
+    assert list(clients) == ["0"]
+    assert clients["0"]["name"] == _expected_trust_name("openshell-gateway")
 
 
 def test_list_trusted_clients_action_unreachable(base_state, transport):
@@ -888,9 +891,9 @@ def test_list_trusted_clients_reports_the_project_restriction(base_state, transp
         ops.charm._connection_factory = tr
         ops.run()
 
-    client = ctx.action_results["clients"][0]
-    assert client["projects"] == ["openshell"]
-    assert client["restricted"] is True
+    client = ctx.action_results["clients"]["0"]
+    assert client["projects"] == "openshell"
+    assert client["restricted"] == "true"
 
 
 def test_list_trusted_clients_reports_an_unrestricted_entry(base_state, transport):
@@ -908,6 +911,6 @@ def test_list_trusted_clients_reports_an_unrestricted_entry(base_state, transpor
         ops.charm._connection_factory = tr
         ops.run()
 
-    client = ctx.action_results["clients"][0]
-    assert client["projects"] == []
-    assert client["restricted"] is False
+    client = ctx.action_results["clients"]["0"]
+    assert client["projects"] == ""
+    assert client["restricted"] == "false"
