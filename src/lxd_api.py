@@ -125,9 +125,14 @@ class LxdClient:
         """Issue a JSON request, walking endpoints in order.
 
         Returns the full decoded JSON body. Verification runs before any request
-        bytes are written. On connect or other transport failure the client
-        advances to the next endpoint; verification failures are raised
-        immediately.
+        bytes are written.
+
+        On a transport failure, and on a 5xx from the endpoint, the client
+        advances to the next endpoint: one cluster member being down or
+        restarting is the case the endpoint list exists for. A 4xx is the
+        server answering — the same answer every member would give — so it is
+        raised as it stands, and so is a verification failure, which means the
+        endpoint is not the LXD that was pinned.
         """
         last_error: Exception | None = None
         for host, port in self._endpoints:
@@ -142,9 +147,13 @@ class LxdClient:
                 response = conn.getresponse()
                 response_body = response.read()
                 if response.status >= 400:
-                    raise LxdApiError(
+                    error = LxdApiError(
                         response.status, response_body.decode("utf-8", errors="replace")
                     )
+                    if response.status >= 500:
+                        last_error = error
+                        continue
+                    raise error
                 return json.loads(response_body)
             except (VerificationError, LxdApiError):
                 raise
@@ -155,6 +164,8 @@ class LxdClient:
                 if conn is not None:
                     conn.close()
 
+        if isinstance(last_error, LxdApiError):
+            raise last_error
         raise LxdConnectionError(f"all endpoints exhausted: {last_error}")
 
     def get_server_info(self) -> dict:
