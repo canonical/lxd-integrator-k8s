@@ -259,15 +259,18 @@ def test_non_charm_owned_entry_not_revoked(base_state, transport):
     assert len(deletes) == 0
 
 
-def test_requirer_projects_override_default(cert_pair, transport):
+def _register(cert_pair, transport, requirer_projects, **config):
+    """Reconcile with one requirer and return the POSTed body, or None."""
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
     ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
-    requirer_cert = cert_pair[0]
+    remote_app_data = {"certificate": cert_pair[0]}
+    if requirer_projects is not None:
+        remote_app_data["projects"] = requirer_projects
     relation = Relation(
         endpoint="https",
         remote_app_name="openshell-gateway",
-        remote_app_data={"certificate": requirer_cert, "projects": "project-a, project-b"},
+        remote_app_data=remote_app_data,
     )
     state = _state(
         cert_pem,
@@ -275,17 +278,73 @@ def test_requirer_projects_override_default(cert_pair, transport):
         fingerprint,
         relations={relation},
         leader=True,
-        **{"default-projects": "default"},
+        **config,
     )
     tr = transport()
     tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     tr.add_response("POST", "/1.0/certificates", 200, {})
     _run_reconcile(ctx, state, tr)
 
-    post = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")][0]
-    body = json.loads(post[2] or b"{}")
+    posts = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]
+    if not posts:
+        return None
+    return json.loads(posts[0][2] or b"{}")
+
+
+def test_requirer_may_narrow_within_the_configured_projects(cert_pair, transport):
+    body = _register(
+        cert_pair,
+        transport,
+        "project-a",
+        **{"default-projects": "project-a, project-b"},
+    )
+    assert body["projects"] == ["project-a"]
+    assert body["restricted"] is True
+
+
+def test_requirer_cannot_reach_outside_the_configured_projects(cert_pair, transport):
+    # The requirer writes this key into its own databag, so honouring it would
+    # let it choose how wide its own LXD credential is.
+    body = _register(cert_pair, transport, "project-a, elsewhere", **{"project": "project-a"})
+    assert body["projects"] == ["project-a"]
+    assert body["restricted"] is True
+
+    assert _register(cert_pair, transport, "elsewhere", **{"project": "project-a"}) is None
+
+
+def test_requirer_cannot_remove_its_own_restriction(cert_pair, transport):
+    # ``,`` is truthy but parses to an empty list, which LXD reads as "not
+    # restricted" — the widest possible credential from the narrowest input.
+    for raw in (",", " , ", ""):
+        body = _register(cert_pair, transport, raw, **{"project": "openshell"})
+        assert body["projects"] == ["openshell"], raw
+        assert body["restricted"] is True, raw
+
+
+def test_requirer_project_names_are_validated(cert_pair, transport):
+    body = _register(
+        cert_pair,
+        transport,
+        "project a/../other",
+        **{"default-projects": "project-a"},
+    )
+    assert body["projects"] == ["project-a"]
+
+
+def test_requirer_projects_apply_when_the_operator_restricted_nothing(cert_pair, transport):
+    # With no upper bound there is nothing to narrow to, and honouring the
+    # requirer's own list can only reduce the reach it would otherwise have.
+    body = _register(cert_pair, transport, "project-a, project-b")
     assert body["projects"] == ["project-a", "project-b"]
     assert body["restricted"] is True
+
+
+def test_an_unrestricted_entry_says_so_explicitly(cert_pair, transport):
+    # LXD defaults ``restricted`` to false, so leaving the key out registered
+    # an unrestricted certificate without the request ever saying that.
+    body = _register(cert_pair, transport, None)
+    assert body["projects"] == []
+    assert body["restricted"] is False
 
 
 def test_default_projects_parsed_and_restricted(base_state, transport, requirer_cert):
@@ -441,8 +500,11 @@ def test_list_trusted_clients_action(base_state, transport):
         ops.run()
 
     clients = ctx.action_results["clients"]
-    assert len(clients) == 1
-    assert clients[0]["name"] == _expected_trust_name("openshell-gateway")
+    assert ctx.action_results["count"] == "1"
+    # Keyed by position so ops flattens it into Juju's dotted result keys; a
+    # list here came back out as a Python repr.
+    assert list(clients) == ["0"]
+    assert clients["0"]["name"] == _expected_trust_name("openshell-gateway")
 
 
 def test_list_trusted_clients_action_unreachable(base_state, transport):
@@ -634,3 +696,221 @@ def test_reconcile_skips_on_verification_error(cert_pair, transport):
     assert rel_out.local_unit_data["addresses"] == "localhost:8443"
     assert len([r for r in tr.requests if r[:2] == ("GET", "/1.0/certificates?recursion=1")]) == 0
     assert len([r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]) == 0
+
+
+def test_project_published_to_requirer(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    state_out = _run_reconcile(ctx, state, tr)
+
+    rel_out = state_out.get_relation(relation.id)
+    assert rel_out.local_unit_data["project"] == "openshell"
+
+
+def test_project_absent_from_databag_when_unset(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
+    state = base_state(relations={relation}, leader=True)
+    tr = transport()
+    state_out = _run_reconcile(ctx, state, tr)
+
+    rel_out = state_out.get_relation(relation.id)
+    assert "project" not in rel_out.local_unit_data
+
+
+def test_unsetting_project_clears_it_from_the_databag(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        local_unit_data={"project": "openshell"},
+    )
+    state = base_state(relations={relation}, leader=True)
+    tr = transport()
+    state_out = _run_reconcile(ctx, state, tr)
+
+    rel_out = state_out.get_relation(relation.id)
+    assert "project" not in rel_out.local_unit_data
+
+
+def test_project_restricts_the_trust_entry(base_state, transport, requirer_cert):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    state = base_state(
+        relations={relation},
+        leader=True,
+        project="openshell",
+        **{"default-projects": "project-a, project-b"},
+    )
+    tr = transport()
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
+    tr.add_response("POST", "/1.0/certificates", 200, {})
+    _run_reconcile(ctx, state, tr)
+
+    post = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")][0]
+    body = json.loads(post[2] or b"{}")
+    assert body["projects"] == ["openshell"]
+    assert body["restricted"] is True
+
+
+def test_invalid_project_is_a_config_error(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    state = base_state(leader=True, project="bad/project")
+    with ctx._run(ctx.on.config_changed(), state) as ops:
+        ops.charm._connection_factory = transport()
+        ops.run()
+        charm = ops.charm
+
+    assert charm._model is None
+    assert charm._config_error is not None
+    assert "project" in charm._config_error
+
+
+def test_changing_the_project_updates_an_existing_trust_entry(
+    base_state, transport, requirer_cert
+):
+    # The entry is created before the project is configured, which is the
+    # ordering an operator hits when they set `project` on a running
+    # deployment. Without convergence the isolation never reaches LXD.
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    fingerprint = pem_fingerprint(requirer_cert.strip())
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": _expected_trust_name("openshell-gateway"),
+                "fingerprint": fingerprint,
+                "projects": [],
+                "restricted": False,
+            }
+        ],
+    )
+    tr.add_response("PATCH", f"/1.0/certificates/{fingerprint}", 200, {})
+    _run_reconcile(ctx, state, tr)
+
+    patches = [r for r in tr.requests if r[0] == "PATCH"]
+    assert len(patches) == 1
+    body = json.loads(patches[0][2] or b"{}")
+    assert body["projects"] == ["openshell"]
+    assert body["restricted"] is True
+    assert not [r for r in tr.requests if r[0] == "DELETE"]
+
+
+def test_a_matching_trust_entry_is_left_alone(base_state, transport, requirer_cert):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    fingerprint = pem_fingerprint(requirer_cert.strip())
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": _expected_trust_name("openshell-gateway"),
+                "fingerprint": fingerprint,
+                "projects": ["openshell"],
+                "restricted": True,
+            }
+        ],
+    )
+    _run_reconcile(ctx, state, tr)
+
+    assert not [r for r in tr.requests if r[0] in ("PATCH", "POST", "DELETE")]
+
+
+def test_another_charms_trust_entry_is_never_touched(base_state, transport, requirer_cert):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    relation = Relation(
+        endpoint="https",
+        remote_app_name="openshell-gateway",
+        remote_app_data={"certificate": requirer_cert.strip()},
+    )
+    fingerprint = pem_fingerprint(requirer_cert.strip())
+    state = base_state(relations={relation}, leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": "someone-elses-entry",
+                "fingerprint": fingerprint,
+                "projects": [],
+                "restricted": False,
+            }
+        ],
+    )
+    _run_reconcile(ctx, state, tr)
+
+    assert not [r for r in tr.requests if r[0] == "PATCH"]
+
+
+def test_list_trusted_clients_reports_the_project_restriction(base_state, transport):
+    # The restriction is the whole point of the project option, so it has to be
+    # visible without reaching for the LXD CLI.
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    state = base_state(leader=True, project="openshell")
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [
+            {
+                "name": _expected_trust_name("openshell-gateway"),
+                "fingerprint": "aa" * 32,
+                "restricted": True,
+                "projects": ["openshell"],
+            }
+        ],
+    )
+
+    with ctx._run(ctx.on.action("list-trusted-clients"), state) as ops:
+        ops.charm._connection_factory = tr
+        ops.run()
+
+    client = ctx.action_results["clients"]["0"]
+    assert client["projects"] == "openshell"
+    assert client["restricted"] == "true"
+
+
+def test_list_trusted_clients_reports_an_unrestricted_entry(base_state, transport):
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
+    state = base_state(leader=True)
+    tr = transport()
+    tr.add_response(
+        "GET",
+        "/1.0/certificates?recursion=1",
+        200,
+        [{"name": _expected_trust_name("openshell-gateway"), "fingerprint": "aa" * 32}],
+    )
+
+    with ctx._run(ctx.on.action("list-trusted-clients"), state) as ops:
+        ops.charm._connection_factory = tr
+        ops.run()
+
+    client = ctx.action_results["clients"]["0"]
+    assert client["projects"] == ""
+    assert client["restricted"] == "false"

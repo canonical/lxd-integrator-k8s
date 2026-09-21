@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from config_model import (
     DEFAULT_LXD_PORT,
     IntegratorConfig,
@@ -168,3 +170,48 @@ def test_parsed_projects():
         }
     )
     assert cfg_empty.parsed_projects == []
+
+
+_BASE = {
+    "lxd-endpoints": "localhost",
+    "client-cert": "CERT",
+    "client-key": "KEY",
+    "server-cert": "SERVER_CERT",
+}
+
+
+def test_project_defaults_to_none():
+    cfg = IntegratorConfig.model_validate(dict(_BASE))
+    assert cfg.project is None
+    assert cfg.parsed_projects == []
+
+
+def test_project_empty_string_is_none():
+    cfg = IntegratorConfig.model_validate({**_BASE, "project": ""})
+    assert cfg.project is None
+
+
+@pytest.mark.parametrize("name", ["openshell", "a", "a" * 63, "proj-1_2.3"])
+def test_project_accepts_lxd_names(name):
+    cfg = IntegratorConfig.model_validate({**_BASE, "project": name})
+    assert cfg.project == name
+
+
+@pytest.mark.parametrize("name", ["bad/project", "a" * 64, "has space", "tab\t", "a\nb"])
+def test_project_rejects_invalid_names(name):
+    model, error = load_config({**_BASE, "project": name})
+    assert model is None
+    assert error is not None
+    assert "project" in error
+
+
+def test_project_wins_over_default_projects():
+    cfg = IntegratorConfig.model_validate(
+        {**_BASE, "project": "openshell", "default-projects": "a,b"}
+    )
+    assert cfg.parsed_projects == ["openshell"]
+
+
+def test_default_projects_used_when_project_unset():
+    cfg = IntegratorConfig.model_validate({**_BASE, "default-projects": "a, b"})
+    assert cfg.parsed_projects == ["a", "b"]

@@ -9,7 +9,7 @@ import logging
 
 import ops
 
-from config_model import IntegratorConfig, load_config
+from config_model import PROJECT_NAME_RE, IntegratorConfig, load_config
 from lxd_api import LxdApiError, LxdClient, LxdConnectionError, VerificationError, pem_fingerprint
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,8 @@ class LxdIntegratorCharm(ops.CharmBase):
         }
         if self._model.server_cert is not None:
             bag["certificate"] = self._model.server_cert
+        if self._model.project is not None:
+            bag["project"] = self._model.project
         return bag
 
     def _server_fingerprint(self) -> str:
@@ -157,6 +159,12 @@ class LxdIntegratorCharm(ops.CharmBase):
                 continue
             target = relation.data[self.app] if clustered else relation.data[self.unit]
             target.update(bag)
+            # update() never removes, so an optional key that has just been
+            # unset in config would otherwise linger in the databag and keep
+            # requirers pointed at a project the operator no longer wants.
+            for optional in ("certificate", "project"):
+                if optional not in bag:
+                    target.pop(optional, None)
 
     def _trust_name(self, relation: ops.Relation) -> str:
         """Return the LXD trust entry name for a related application.
@@ -201,18 +209,66 @@ class LxdIntegratorCharm(ops.CharmBase):
         """Read the requirer's published certificate from the relation."""
         return self._read_relation_raw(relation, "certificate")
 
-    def _requirer_projects(self, relation: ops.Relation) -> list[str]:
-        """Read per-relation projects, falling back to config defaults."""
+    def _requirer_projects(self, relation: ops.Relation) -> list[str] | None:
+        """Return the projects to restrict *relation*'s certificate to, or None.
+
+        The operator's configuration is the upper bound. A requirer may ask for
+        a subset of it — an application that only needs one of several allowed
+        projects has no business holding trust in the rest — but never for a
+        project the operator did not allow, and never for no restriction at
+        all. Both of those are writes the requirer makes to its own databag,
+        and either would hand it an LXD credential wider than the one the
+        operator described.
+
+        Returns None when the request cannot be honoured, so the caller can
+        leave the trust store alone and say why rather than registering
+        something the operator did not ask for.
+        """
         assert self._model is not None
+        allowed = self._model.parsed_projects
         raw = self._read_relation_raw(relation, "projects")
-        if raw:
-            return [part.strip() for part in raw.split(",") if part.strip()]
-        return self._model.parsed_projects
+        if not raw:
+            return allowed
+
+        requested = [part.strip() for part in raw.split(",") if part.strip()]
+        invalid = [name for name in requested if not PROJECT_NAME_RE.fullmatch(name)]
+        if invalid or not requested:
+            logger.warning(
+                "Relation %s asked for an unusable project list %r; using the configured %r",
+                relation.id,
+                raw,
+                allowed,
+            )
+            return allowed
+
+        if not allowed:
+            # The operator restricted nothing, so there is no upper bound to
+            # narrow to and the requirer's own list is the only restriction
+            # anyone asked for. Honouring it can only reduce its reach.
+            return requested
+
+        narrowed = [name for name in requested if name in allowed]
+        if not narrowed:
+            logger.warning(
+                "Relation %s asked for projects %r, none of which the operator allows (%r); "
+                "not registering its certificate",
+                relation.id,
+                requested,
+                allowed,
+            )
+            return None
+        if len(narrowed) != len(requested):
+            logger.warning(
+                "Relation %s asked for projects %r; narrowing to the configured %r",
+                relation.id,
+                requested,
+                narrowed,
+            )
+        return narrowed
 
     def _converge_trust(
         self,
         client: LxdClient,
-        live_relations: set[str],
         broken_relation_id: int | None = None,
     ) -> None:
         """Register related certs and revoke orphaned or rotated charm-owned entries."""
@@ -238,14 +294,25 @@ class LxdIntegratorCharm(ops.CharmBase):
                     relation.id,
                 )
                 continue
+            projects = self._requirer_projects(relation)
+            if projects is None:
+                # Asked for reach the operator does not allow. Leaving the name
+                # out of expected_by_name also revokes an entry registered
+                # before the request changed.
+                continue
             name = self._trust_name(relation)
             expected_by_name[name] = fp
             if fp in known_fingerprints:
+                # The entry exists, but the project restriction is config and
+                # config changes. Without this the isolation an operator asks
+                # for by setting `project` never reaches LXD on an existing
+                # relation, and the entry silently keeps its old reach.
+                self._converge_trust_projects(client, trust_entries, fp, projects)
                 continue
             client.add_trusted_certificate(
                 cert,
                 name=name,
-                projects=self._requirer_projects(relation),
+                projects=projects,
                 trust_token=self._model.trust_token,
             )
 
@@ -260,6 +327,34 @@ class LxdIntegratorCharm(ops.CharmBase):
             if expected_fp is None or expected_fp != entry_fp:
                 client.remove_trusted_certificate(entry_fp)
 
+    def _converge_trust_projects(
+        self,
+        client: LxdClient,
+        trust_entries: list[dict],
+        fingerprint: str,
+        projects: list[str],
+    ) -> None:
+        """Bring an existing entry's project restriction in line with config."""
+        entry = next(
+            (e for e in trust_entries if e.get("fingerprint", "").lower() == fingerprint),
+            None,
+        )
+        if entry is None or not self._is_charm_owned(entry):
+            return
+
+        current = entry.get("projects") or []
+        restricted = bool(entry.get("restricted"))
+        if sorted(current) == sorted(projects) and restricted == bool(projects):
+            return
+
+        logger.info(
+            "Updating trust entry %s: projects %s -> %s",
+            entry.get("name", fingerprint),
+            current,
+            projects,
+        )
+        client.set_trusted_certificate_projects(fingerprint, projects)
+
     def _reconcile(self, event: ops.EventBase) -> None:
         """Idempotently publish connection info and converge the LXD trust store."""
         self._publish_connection_info()
@@ -270,17 +365,15 @@ class LxdIntegratorCharm(ops.CharmBase):
             return
 
         broken_relation_id: int | None = None
-        live_relations: set[str] = set()
         for relation in self.model.relations[HTTPS_RELATION]:
             if relation.app is None:
                 continue
             if isinstance(event, ops.RelationBrokenEvent) and event.relation.id == relation.id:
                 broken_relation_id = relation.id
-                continue
-            live_relations.add(relation.app.name)
+                break
 
         try:
-            self._converge_trust(client, live_relations, broken_relation_id)
+            self._converge_trust(client, broken_relation_id)
         except (LxdConnectionError, VerificationError, LxdApiError) as exc:
             logger.warning("Skipping trust convergence: %s", exc)
 
@@ -363,6 +456,7 @@ class LxdIntegratorCharm(ops.CharmBase):
                 "endpoint": addresses[0],
                 "certificate-fingerprint": self._server_fingerprint(),
                 "addresses": ",".join(addresses),
+                "project": self._model.project or "",
             }
         )
 
@@ -385,12 +479,25 @@ class LxdIntegratorCharm(ops.CharmBase):
             event.fail(f"LXD API error: {exc}")
             return
 
-        owned = [
-            {"name": entry.get("name", ""), "fingerprint": entry.get("fingerprint", "")}
-            for entry in entries
-            if self._is_charm_owned(entry)
-        ]
-        event.set_results({"clients": owned})
+        # Keyed by position rather than collected into a list: ops flattens a
+        # nested mapping into the dotted keys Juju's action results use, but
+        # stringifies a list, which turned this output into a Python repr that
+        # is neither YAML nor JSON and cannot be read by a script.
+        owned = {
+            str(index): {
+                "name": entry.get("name", ""),
+                "fingerprint": entry.get("fingerprint", ""),
+                # The projects an entry is restricted to are the whole point of
+                # the `project` option, so an operator has to be able to see
+                # them without reaching for the LXD CLI.
+                "restricted": "true" if entry.get("restricted") else "false",
+                "projects": ",".join(entry.get("projects") or []),
+            }
+            for index, entry in enumerate(
+                entry for entry in entries if self._is_charm_owned(entry)
+            )
+        }
+        event.set_results({"clients": owned, "count": str(len(owned))})
 
 
 if __name__ == "__main__":

@@ -347,7 +347,7 @@ def test_add_trusted_certificate_sets_restricted(cert_pair):
     assert base64.b64decode(payload["certificate"]) == cert_der
 
 
-def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
+def test_add_trusted_certificate_says_an_empty_list_is_unrestricted(cert_pair):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
     conn = FakeConnection(cert_der, json.dumps({"metadata": {}}).encode())
@@ -361,7 +361,10 @@ def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
     )
     client.add_trusted_certificate(cert_pem, "test", projects=[])
     payload = json.loads(conn.requests[0][2] or b"{}")
-    assert "restricted" not in payload
+    # Explicit, so this and the PATCH in set_trusted_certificate_projects
+    # cannot disagree: LXD's own default for a missing key is false, which
+    # registered an unrestricted certificate without saying so.
+    assert payload["restricted"] is False
     assert payload["projects"] == []
     assert base64.b64decode(payload["certificate"]) == cert_der
 
@@ -407,3 +410,63 @@ def test_connection_timeout_passed_to_factory(cert_pair):
     with pytest.raises(VerificationError):
         client.get_server_info()
     assert seen == [("localhost", 8443, 5.0)]
+
+
+def _two_endpoint_client(cert_pair, answers):
+    """Build a client over two endpoints, each answering with its own status."""
+    cert_pem, key_pem, cert_der = cert_pair
+    made: list[FakeConnection] = []
+
+    def factory(host, _port, _timeout):
+        status, body = answers[host]
+        conn = FakeConnection(cert_der, response_body=body, status=status)
+        made.append(conn)
+        return conn
+
+    client = LxdClient(
+        endpoints=(("first", 8443), ("second", 8443)),
+        verification_mode=VerificationMode.FINGERPRINT,
+        server_pin=hashlib.sha256(cert_der).hexdigest(),
+        client_cert=cert_pem,
+        client_key=key_pem,
+        connection_factory=factory,
+    )
+    return client, made
+
+
+def test_a_server_error_moves_to_the_next_endpoint(cert_pair):
+    # One cluster member down or restarting is what the endpoint list is for.
+    ok = json.dumps({"metadata": {"ok": True}}).encode()
+    client, made = _two_endpoint_client(
+        cert_pair,
+        {"first": (503, b"unavailable"), "second": (200, ok)},
+    )
+
+    assert client.get_server_info() == {"ok": True}
+    assert len(made) == 2
+
+
+def test_a_client_error_is_the_server_answering_and_is_not_retried(cert_pair):
+    # Every member would give the same answer, so trying the next one only
+    # hides which endpoint said it.
+    client, made = _two_endpoint_client(
+        cert_pair,
+        {"first": (403, b"forbidden"), "second": (200, b"{}")},
+    )
+
+    with pytest.raises(LxdApiError) as exc_info:
+        client.get_server_info()
+    assert exc_info.value.status == 403
+    assert len(made) == 1
+
+
+def test_a_server_error_from_every_endpoint_is_raised_as_itself(cert_pair):
+    # Not an LxdConnectionError: the servers answered, they just all failed.
+    client, _ = _two_endpoint_client(
+        cert_pair,
+        {"first": (503, b"unavailable"), "second": (502, b"bad gateway")},
+    )
+
+    with pytest.raises(LxdApiError) as exc_info:
+        client.get_server_info()
+    assert exc_info.value.status == 502
